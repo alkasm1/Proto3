@@ -1,0 +1,312 @@
+<!DOCTYPE html>
+<html lang="ar" dir="rtl">
+<head>
+  <meta charset="UTF-8" />
+  <title>نظام BRHM لحماية الكتب</title>
+  <style>
+    body { font-family: sans-serif; background:#111; color:#eee; padding:20px; }
+    h1, h2 { color:#0ff; }
+    textarea { width:100%; height:150px; margin:5px 0; background:#000; color:#0f0; padding:10px; }
+    input, button { padding:8px; margin:5px 0; }
+    .section { border:1px solid #333; padding:15px; margin-bottom:20px; border-radius:8px; }
+    .label { font-weight:bold; color:#0f9; }
+    pre { background:#000; color:#0f0; padding:10px; overflow:auto; }
+  </style>
+</head>
+<body>
+
+  <h1>نظام BRHM لحماية الكتب — نسخة المجال الترددي</h1>
+
+  <!-- ========================= -->
+  <!-- 1) تشفير نص إلى BRHM -->
+  <!-- ========================= -->
+  <div class="section">
+    <h2>1) تشفير نص وتحويله إلى ملف BRHM</h2>
+
+    <div class="label">النص الأصلي:</div>
+    <textarea id="inputText" placeholder="ضع هنا نص الكتاب أو الفصل..."></textarea>
+
+    <div class="label">مفتاح الشراء (Purchase Key):</div>
+    <input id="purchaseKey" type="text" placeholder="مثال: USER-123-ABC" style="width:100%;" />
+
+    <div class="label">المجال الترددي الخاص بالمستخدم (Frequency Key):</div>
+    <input id="freqKey" type="number" placeholder="مثال: 137 أو 44100" style="width:100%;" />
+
+    <button onclick="encodeToBRHM()">تشفير وتوليد ملف BRHM</button>
+
+    <div class="label">محتوى ملف BRHM (للعرض فقط):</div>
+    <pre id="brhmOutput"></pre>
+
+    <button onclick="downloadBRHM()">تحميل ملف BRHM</button>
+  </div>
+
+  <!-- ========================= -->
+  <!-- 2) فك ملف BRHM -->
+  <!-- ========================= -->
+  <div class="section">
+    <h2>2) فك ملف BRHM واسترجاع النص</h2>
+
+    <div class="label">رفع ملف BRHM:</div>
+    <input type="file" id="brhmFileInput" accept=".brhm,.json" />
+
+    <div class="label">مفتاح الشراء:</div>
+    <input id="purchaseKeyDecode" type="text" placeholder="نفس المفتاح المستخدم عند التشفير" style="width:100%;" />
+
+    <div class="label">المجال الترددي للمستخدم:</div>
+    <input id="freqKeyDecode" type="number" placeholder="نفس القيمة المستخدمة عند التشفير" style="width:100%;" />
+
+    <button onclick="decodeBRHM()">فك ملف BRHM</button>
+
+    <div class="label">النص المسترجع:</div>
+    <textarea id="decodedText" readonly></textarea>
+  </div>
+
+  <script>
+    /***********************
+     * أدوات مساعدة عامة
+     ***********************/
+    function stringToUtf8Bytes(str) {
+      return new TextEncoder().encode(str);
+    }
+
+    function utf8BytesToString(bytes) {
+      return new TextDecoder().decode(bytes);
+    }
+
+    function xorBytes(dataBytes, keyBytes) {
+      const out = new Uint8Array(dataBytes.length);
+      for (let i = 0; i < dataBytes.length; i++) {
+        out[i] = dataBytes[i] ^ keyBytes[i % keyBytes.length];
+      }
+      return out;
+    }
+
+    function bytesToBase64(bytes) {
+      let binary = "";
+      for (let i = 0; i < bytes.length; i++) {
+        binary += String.fromCharCode(bytes[i]);
+      }
+      return btoa(binary);
+    }
+
+    function base64ToBytes(b64) {
+      const binary = atob(b64);
+      const bytes = new Uint8Array(binary.length);
+      for (let i = 0; i < binary.length; i++) {
+        bytes[i] = binary.charCodeAt(i);
+      }
+      return bytes;
+    }
+
+    /************************************
+     * ترميز البلوكات إلى أرقام C
+     ************************************/
+    const ARABIC_CHARS = " اابتثجحخدذرزسشصضطظعغفقكلمنهويءآأؤإئىة";
+    const CHAR_TO_CODE = {};
+    const CODE_TO_CHAR = {};
+    for (let i = 0; i < ARABIC_CHARS.length; i++) {
+      CHAR_TO_CODE[ARABIC_CHARS[i]] = i;
+      CODE_TO_CHAR[i] = ARABIC_CHARS[i];
+    }
+    const BASE = ARABIC_CHARS.length;
+
+    function splitWordToBlocks(word, blockSize = 5) {
+      const blocks = [];
+      for (let i = 0; i < word.length; i += blockSize) {
+        blocks.push(word.slice(i, i + blockSize));
+      }
+      return blocks;
+    }
+
+    function encodeBlockToC(block) {
+      let value = 0;
+      for (let i = 0; i < block.length; i++) {
+        const code = CHAR_TO_CODE[block[i]] ?? 0;
+        value = value * BASE + code;
+      }
+      return value;
+    }
+
+    function decodeCToBlock(C, length) {
+      let chars = [];
+      let value = C;
+      for (let i = 0; i < length; i++) {
+        const code = value % BASE;
+        value = Math.floor(value / BASE);
+        chars.push(CODE_TO_CHAR[code] ?? " ");
+      }
+      return chars.reverse().join("");
+    }
+
+    function textToCList(text) {
+      const words = text.split(/\s+/).filter(w => w.length > 0);
+      const result = [];
+      for (const word of words) {
+        const blocks = splitWordToBlocks(word);
+        for (const block of blocks) {
+          result.push({ len: block.length, C: encodeBlockToC(block) });
+        }
+        result.push({ len: 0, C: -1 });
+      }
+      return result;
+    }
+
+    function cListToText(cList) {
+      let words = [];
+      let current = "";
+      for (const item of cList) {
+        if (item.C === -1) {
+          if (current.length > 0) {
+            words.push(current);
+            current = "";
+          }
+        } else {
+          current += decodeCToBlock(item.C, item.len);
+        }
+      }
+      if (current.length > 0) words.push(current);
+      return words.join(" ");
+    }
+
+    /************************************
+     * C → ثنائي
+     ************************************/
+    function cListToBinary(cList) {
+      const bits = [];
+      for (const item of cList) {
+        let len = item.len & 0b111;
+        let C = item.C < 0 ? 0 : item.C;
+        if (item.C < 0) len = 0;
+
+        let value = (len << 29) | (C & 0x1FFFFFFF);
+        for (let i = 31; i >= 0; i--) {
+          bits.push((value >> i) & 1);
+        }
+      }
+      return bits;
+    }
+
+    function binaryToCList(bits) {
+      const cList = [];
+      for (let i = 0; i < bits.length; i += 32) {
+        if (i + 32 > bits.length) break;
+        let value = 0;
+        for (let j = 0; j < 32; j++) {
+          value = (value << 1) | bits[i + j];
+        }
+        const len = (value >> 29) & 0b111;
+        const C = value & 0x1FFFFFFF;
+        cList.push(len === 0 ? { len: 0, C: -1 } : { len, C });
+      }
+      return cList;
+    }
+
+    function bitsToBytes(bits) {
+      const bytes = new Uint8Array(Math.ceil(bits.length / 8));
+      for (let i = 0; i < bits.length; i++) {
+        const idx = Math.floor(i / 8);
+        bytes[idx] = (bytes[idx] << 1) | bits[i];
+      }
+      return bytes;
+    }
+
+    function bytesToBits(bytes) {
+      const bits = [];
+      for (let b of bytes) {
+        for (let i = 7; i >= 0; i--) bits.push((b >> i) & 1);
+      }
+      return bits;
+    }
+
+    /************************************
+     * دمج مفتاح الشراء + المجال الترددي
+     ************************************/
+    function buildCombinedKey(purchaseKey, freqKey) {
+      const keyBytes = stringToUtf8Bytes(purchaseKey);
+      const freqBytes = stringToUtf8Bytes(freqKey.toString());
+      return xorBytes(keyBytes, freqBytes);
+    }
+
+    /************************************
+     * تشفير BRHM
+     ************************************/
+    let lastBRHMObject = null;
+
+    function encodeToBRHM() {
+      const text = document.getElementById("inputText").value.trim();
+      const purchaseKey = document.getElementById("purchaseKey").value.trim();
+      const freqKey = document.getElementById("freqKey").value.trim();
+
+      if (!text || !purchaseKey || !freqKey) {
+        alert("الرجاء إدخال النص + مفتاح الشراء + المجال الترددي");
+        return;
+      }
+
+      const cList = textToCList(text);
+      const bits = cListToBinary(cList);
+      const dataBytes = bitsToBytes(bits);
+
+      const combinedKey = buildCombinedKey(purchaseKey, freqKey);
+      const encBytes = xorBytes(dataBytes, combinedKey);
+      const encBase64 = bytesToBase64(encBytes);
+
+      const brhm = {
+        header: {
+          version: 1,
+          encryption: "XOR + Frequency",
+          bookId: "BOOK-001",
+          createdAt: new Date().toISOString()
+        },
+        body: { data: encBase64 }
+      };
+
+      lastBRHMObject = brhm;
+      document.getElementById("brhmOutput").textContent = JSON.stringify(brhm, null, 2);
+    }
+
+    function downloadBRHM() {
+      if (!lastBRHMObject) return alert("لا يوجد ملف BRHM بعد");
+      const blob = new Blob([JSON.stringify(lastBRHMObject)], { type: "application/json" });
+      const a = document.createElement("a");
+      a.href = URL.createObjectURL(blob);
+      a.download = "book.brhm.json";
+      a.click();
+    }
+
+    /************************************
+     * فك BRHM
+     ************************************/
+    function decodeBRHM() {
+      const fileInput = document.getElementById("brhmFileInput");
+      const purchaseKey = document.getElementById("purchaseKeyDecode").value.trim();
+      const freqKey = document.getElementById("freqKeyDecode").value.trim();
+
+      if (!fileInput.files.length || !purchaseKey || !freqKey) {
+        alert("الرجاء اختيار الملف + إدخال المفتاح + المجال الترددي");
+        return;
+      }
+
+      const reader = new FileReader();
+      reader.onload = function(e) {
+        try {
+          const brhm = JSON.parse(e.target.result);
+          const encBytes = base64ToBytes(brhm.body.data);
+
+          const combinedKey = buildCombinedKey(purchaseKey, freqKey);
+          const dataBytes = xorBytes(encBytes, combinedKey);
+
+          const bits = bytesToBits(dataBytes);
+          const cList = binaryToCList(bits);
+          const text = cListToText(cList);
+
+          document.getElementById("decodedText").value = text;
+        } catch {
+          alert("فشل فك التشفير — ربما المفتاح أو المجال الترددي غير صحيح");
+        }
+      };
+      reader.readAsText(fileInput.files[0]);
+    }
+  </script>
+
+</body>
+</html>
